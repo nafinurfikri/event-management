@@ -1,0 +1,12 @@
+{
+    "mcpServers": {
+        "laravel-boost": {
+            "command": "wsl.exe",
+            "args": [
+                "/home/nafin/.config/herd-lite/bin/php",
+                "/home/nafin/smk-ti-dwiguna/event-management/artisan",
+                "boost:mcp"
+            ]
+        }
+    }
+}
