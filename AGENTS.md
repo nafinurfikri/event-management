@@ -1,149 +1,155 @@
-<laravel-boost-guidelines>
-=== foundation rules ===
+# AGENTS.md — Event Management & QR Code Check-in System
 
-# Laravel Boost Guidelines
+## 1. Gambaran Umum Proyek
 
-## Foundational Context
+Aplikasi web **Multi-Event Management** yang dirancang ringan dan cepat untuk mengelola pendaftaran berbagai acara secara terpisah melalui **Direct Link (`/e/{slug}`)**, verifikasi pembayaran manual, hingga validasi kehadiran di hari-H tanpa memerlukan manajemen akun untuk panitia lapangan.
 
-This application is a Laravel application running on PHP 8.5. Always use the APIs that match the installed major version of each package — do not assume a version.
+### Aktor & Model Akses
 
-Before relying on a package's API, confirm its installed version:
-- PHP packages: run `composer show --direct` to list direct dependencies with versions, or `composer show <vendor/package>` for a single package.
-- JS packages: check `package.json` for the installed versions.
+1. **Admin (Single Role — Authenticated):** Satu-satunya pengguna yang memiliki akun login (email & password). Mengelola banyak event, menyalin tautan registrasi per event, mengatur kuota, memverifikasi bukti pembayaran peserta (approve/reject), membuat/menonaktifkan _link scanner_, memantau kehadiran, dan mengekspor laporan.
+2. **Peserta (Publik — Tanpa Login):** Mengakses halaman registrasi spesifik melalui tautan langsung (`/e/{slug}`) yang dibagikan penyelenggara, mengisi data diri, mengunggah bukti pembayaran, dan menerima email konfirmasi (berisi QR code jika disetujui, atau email pemberitahuan penolakan jika ditolak).
+3. **Pengelola / Petugas Lapangan / Panitia (Tokenized Access — Tanpa Login):** Mengakses halaman pemindai kamera (_scanner_) melalui tautan unik ber-hash (`/scan/{token_hash}`) yang dibagikan oleh Admin.
 
-## Skills Activation
+---
 
-This project has domain-specific skills available in `**/skills/**`. You MUST activate the relevant skill whenever you work in that domain—don't wait until you're stuck.
+## 2. Tech Stack & Lingkungan Pengembangan
 
-## Conventions
+- **Backend:** Laravel 13
+- **Frontend:** Blade + Tailwind CSS
+- **Database:** MySQL
+- **QR Code Library:** `simplesoftwareio/simple-qrcode`
+- **Scanner Client-Side:** `html5-qrcode`
+- **Mail Service:** Mailpit (SMTP lokal untuk pengujian pengiriman email)
 
-- You must follow all existing code conventions used in this application. When creating or editing a file, check sibling files for the correct structure, approach, and naming.
-- Use descriptive names for variables and methods. For example, `isRegisteredForDiscounts`, not `discount()`.
-- Check for existing components to reuse before writing a new one.
+---
 
-## Verification Scripts
+## 3. Struktur Database (Core Schema)
 
-- Do not create verification scripts or tinker when tests cover that functionality and prove they work. Unit and feature tests are more important.
+Gunakan struktur relasi berikut sebagai acuan migrasi dan model Eloquent:
 
-## Application Structure & Architecture
+1. **`admins`**
+    - `id` (PK)
+    - `name` (string)
+    - `email` (string, unique)
+    - `password` (string, hashed)
+    - `created_at`, `updated_at`
 
-- Stick to existing directory structure; don't create new base folders without approval.
-- Do not change the application's dependencies without approval.
+2. **`events`**
+    - `id` (PK)
+    - `title` (string)
+    - `slug` (string, unique — URL-friendly identifier unik untuk tautan registrasi publik `/e/{slug}`)
+    - `description` (text, nullable)
+    - `location` (string)
+    - `event_date` (datetime)
+    - `quota` (integer, unsigned)
+    - `price` (unsignedBigInteger, default: 0 — nominal biaya pendaftaran)
+    - `payment_instructions` (text, nullable — informasi nomor rekening / e-wallet / QRIS tujuan transfer)
+    - `is_active` (boolean, default: true)
+    - `created_at`, `updated_at`
 
-## Frontend Bundling
+3. **`registrations`**
+    - `id` (PK)
+    - `event_id` (FK -> `events.id`, cascade on delete)
+    - `name` (string)
+    - `email` (string)
+    - `phone` (string)
+    - `payment_proof` (string — path file bukti pembayaran di storage)
+    - `payment_status` (enum/string: `pending`, `approved`, `rejected`; default: `pending`)
+    - `rejection_reason` (text, nullable — catatan alasan penolakan dari admin)
+    - `verified_by` (FK -> `admins.id`, nullable, null on delete)
+    - `verified_at` (timestamp, nullable)
+    - `ticket_code` (string, unique, nullable — baru di-generate saat `payment_status` menjadi `approved`)
+    - `status` (enum/string: `pending`, `registered`, `checked_in`, `cancelled`; default: `pending`)
+    - `email_sent_at` (timestamp, nullable)
+    - `created_at`, `updated_at`
+    - _Constraint:_ 1 email hanya boleh memiliki 1 pendaftaran aktif per event (`payment_status` `pending` atau `approved`). Izinkan pendaftaran ulang dengan email yang sama pada event tersebut jika pendaftaran sebelumnya berstatus `rejected`.
 
-- If a frontend change doesn't show in the UI or you get a "Unable to locate file in Vite manifest" error, run `npm run build` or ask the user to run `npm run dev` or `composer run dev`.
+4. **`scanner_links`**
+    - `id` (PK)
+    - `event_id` (FK -> `events.id`, cascade on delete)
+    - `label` (string — contoh: `"Gate A"`, `"Petugas Pintu Utama"`)
+    - `token_hash` (string, unique — string kriptografis acak minimal 32 karakter)
+    - `expires_at` (datetime, nullable)
+    - `is_active` (boolean, default: true)
+    - `created_at`, `updated_at`
 
-## Documentation Files
+5. **`checkin_logs`**
+    - `id` (PK)
+    - `registration_id` (FK -> `registrations.id`, nullable jika tiket tidak valid)
+    - `scanner_link_id` (FK -> `scanner_links.id`)
+    - `raw_code` (string — menyimpan kode mentah yang dipindai untuk audit)
+    - `scanned_at` (timestamp)
+    - `status` (enum/string: `success`, `duplicate`, `invalid`)
+    - `created_at`, `updated_at`
 
-- You must only create documentation files if explicitly requested by the user.
+---
 
-=== boost rules ===
+## 4. Alur Bisnis & Aturan Logika Inti
 
-# Laravel Boost
+### A. Manajemen Event & Generate Link Scanner (Admin)
 
-## Tools
+- Admin wajib terautentikasi sebelum mengakses endpoint `/admin/*`.
+- Saat membuat event, sistem otomatis men-generate `slug` unik dari `title` (tambahkan akhiran acak singkat jika judul sama) agar URL publik tidak memakai `id` database.
+- Admin mengisi informasi acara beserta nominal `price` dan `payment_instructions` yang akan tampil di halaman registrasi peserta.
+- Pada daftar event di dashboard Admin, sediakan tombol **"Copy Link Registrasi"** untuk menyalin URL lengkap (`{APP_URL}/e/{slug}`) ke clipboard.
+- Saat membuat _link scanner_, sistem men-generate `token_hash` acak yang tidak bisa ditebak (gunakan `Str::random(40)`), bukan ID berurutan.
+- Admin dapat menonaktifkan (`is_active = false`) atau mengatur `expires_at` pada tautan scanner kapan saja untuk mencabut akses petugas lapangan.
 
-- Laravel Boost is an MCP server with tools designed specifically for this application. Prefer Boost tools over manual alternatives like shell commands or file reads.
-- Use `database-query` to run read-only queries against the database instead of writing raw SQL in tinker.
-- Use `database-schema` to inspect table structure before writing migrations or models.
-- Use `get-absolute-url` to resolve the correct scheme, domain, and port for project URLs. Always use this before sharing a URL with the user.
-- Use `browser-logs` to read browser logs, errors, and exceptions. Only recent logs are useful, ignore old entries.
+### B. Routing Publik, Registrasi Peserta & Upload Bukti Pembayaran
 
-## Searching Documentation (IMPORTANT)
+- **Pola Direct Link (Tanpa Katalog Publik):**
+    - Halaman registrasi setiap event diakses melalui `GET /e/{slug}` dan diproses melalui `POST /e/{slug}`.
+    - Halaman utama (`GET /`) menampilkan halaman sambutan sederhana.
+- Validasi bahwa `event.is_active == true` dan jumlah pendaftar aktif (`payment_status != 'rejected'` dan `status != 'cancelled'`) masih kurang dari `event.quota`.
+- Gunakan **database transaction / locking (`lockForUpdate`)** saat pengecekan kuota untuk mencegah _race condition_ (kelebihan kuota saat traffic tinggi).
+- Peserta wajib mengunggah file `payment_proof` (validasi format gambar/dokumen: `jpg`, `jpeg`, `png`, `pdf`, maksimal `2MB`).
+- Simpan data ke `registrations` dengan `payment_status = 'pending'`, `status = 'pending'`, dan `ticket_code = null`.
+- **Jangan generate atau kirim QR code pada tahap ini.** Tampilkan halaman konfirmasi bahwa pendaftaran berhasil dikirim, sedang menunggu verifikasi pembayaran oleh Admin, dan hasil verifikasi akan dikirim melalui email.
 
-- Use `search-docs` before changes that depend on Laravel ecosystem APIs, behavior, configuration, or version-specific syntax. Skip it for copy-only edits and other changes where package documentation is irrelevant. Reuse sufficient results already in context instead of searching again.
-- Pass a `packages` array to scope results when you know which packages are relevant.
-- Use multiple broad, topic-based queries: `['rate limiting', 'routing rate limiting', 'routing']`. Expect the most relevant results first.
-- Do not add package names to queries because package info is already shared. Use `test resource table`, not `filament 4 test resource table`.
+### C. Verifikasi Pembayaran & Pengiriman Email (Admin)
 
-### Search Syntax
+Admin memeriksa daftar pendaftar beserta pratinjau file bukti pembayaran (`payment_proof`), lalu memilih salah satu dari dua tindakan berikut:
 
-1. Use words for auto-stemmed AND logic: `rate limit` matches both "rate" AND "limit".
-2. Use `"quoted phrases"` for exact position matching: `"infinite scroll"` requires adjacent words in order.
-3. Combine words and phrases for mixed queries: `middleware "rate limit"`.
-4. Use multiple queries for OR logic: `queries=["authentication", "middleware"]`.
+1. **Approve Pembayaran (`POST /admin/registrations/{registration}/approve`):**
+    - Pastikan `payment_status` belum `approved` (cegah duplikasi proses).
+    - Dalam satu transaksi database:
+        - Generate `ticket_code` unik yang sulit ditebak (misal: `Str::upper(Str::random(12))` atau UUID).
+        - Ubah `payment_status = 'approved'`, `status = 'registered'`, `verified_by = auth()->id()`, dan `verified_at = now()`.
+    - Generate gambar QR code dari `ticket_code` menggunakan `simplesoftwareio/simple-qrcode`.
+    - Kirim email menggunakan Mailable khusus tiket (misal: `RegistrationApprovedMail`) yang berisi detail acara dan lampiran/gambar QR code, lalu isi `email_sent_at = now()`.
 
-## Project Rules
+2. **Reject Pembayaran (`POST /admin/registrations/{registration}/reject`):**
+    - Ubah `payment_status = 'rejected'`, `status = 'cancelled'`, `rejection_reason` (opsional dari input admin), `verified_by = auth()->id()`, dan `verified_at = now()`.
+    - Kuota otomatis kembali tersedia dan email peserta tersebut dapat digunakan untuk mendaftar ulang pada event yang sama.
+    - Kirim email menggunakan Mailable berbeda (misal: `RegistrationRejectedMail`) **tanpa QR code**, berisi pesan pemberitahuan bahwa bukti pembayaran tidak dapat diverifikasi (beserta alasan penolakan jika diisi) dan instruksi tindak lanjut, lalu isi `email_sent_at = now()`.
 
-- This project contains committed, area-grouped rules in `.ai/rules` when that directory exists, including path-scoped framework guidelines under `.ai/rules/boost`. Before you enter plan mode or create/edit any file, you MUST first: open @.ai/rules/index.md (it maps file globs to rule files), read every rule file whose globs cover the path(s) in scope, and run `grep -rin 'keyword' .ai/rules` to catch what a path match alone misses. Do not write code until you have read and are following every matching rule. If `.ai/rules` does not exist, continue without it.
+### D. Validasi & Scan QR Code Hari-H (Pengelola)
 
-## Artisan
+- **Validasi Akses Halaman Scanner (`/scan/{token_hash}`):**
+    - Cek apakah `token_hash` ada di `scanner_links`, `is_active == true`, dan belum melewati `expires_at`.
+    - Jika tidak valid/kedaluwarsa, tolak akses (HTTP 403/404) dan tampilkan pesan akses ditolak.
+- **Validasi Tiket Saat Pemindaian (`POST /scan/{token_hash}/verify`):**
+    1. Validasi ulang keabsahan `token_hash` di setiap request API scan.
+    2. Cari `ticket_code` pada tabel `registrations` yang sesuai dengan `event_id` milik `scanner_link` dan memiliki `payment_status == 'approved'`:
+        - **Tidak ditemukan / belum di-approve:** Catat ke `checkin_logs` dengan `status = 'invalid'`. Kembalikan respons **Merah** (_Tiket Tidak Terdaftar / Tidak Valid_).
+        - **Sudah berstatus `checked_in`:** Catat ke `checkin_logs` dengan `status = 'duplicate'`. Kembalikan respons **Kuning** (_Tiket Sudah Digunakan_) beserta waktu check-in sebelumnya.
+        - **Valid (`status == 'registered'`) & belum dipakai:** Dalam satu transaksi atomik, ubah `registrations.status = 'checked_in'` dan simpan log ke `checkin_logs` dengan `status = 'success'`. Kembalikan respons **Hijau** (_Check-in Berhasil_) beserta nama peserta.
 
-- Run Artisan commands directly via the command line (e.g., `php artisan route:list`). Use `php artisan list` to discover available commands and `php artisan [command] --help` to check parameters.
-- Inspect routes with `php artisan route:list`. Filter with: `--method=GET`, `--name=users`, `--path=api`, `--except-vendor`, `--only-vendor`.
-- Read configuration values using dot notation: `php artisan config:show app.name`, `php artisan config:show database.default`. Or read config files directly from the `config/` directory.
+### E. Monitoring & Laporan (Admin)
 
-## Tinker
+- Tampilkan ringkasan per event: total kuota, pendaftar menunggu verifikasi (`pending`), pembayaran disetujui (`approved`), pembayaran ditolak (`rejected`), total sudah _check-in_, dan sisa belum hadir.
+- Sediakan fitur ekspor data pendaftar & kehadiran (nama, email, no HP, `payment_status`, `ticket_code`, status kehadiran, waktu scan, dan label petugas scanner) ke format `.xlsx` atau `.csv`.
 
-- Execute PHP in app context for debugging and testing code. Do not create models without user approval, prefer tests with factories instead. Prefer existing Artisan commands over custom tinker code.
-- Always use single quotes to prevent shell expansion: `php artisan tinker --execute 'Your::code();'`
-  - Double quotes for PHP strings inside: `php artisan tinker --execute 'User::where("active", true)->count();'`
+---
 
-=== php rules ===
+## 5. Aturan Keamanan & Konvensi Kode
 
-# PHP
-
-- Always use curly braces for control structures, even for single-line bodies.
-- Use PHP 8 constructor property promotion: `public function __construct(public GitHub $github) { }`. Do not leave empty zero-parameter `__construct()` methods unless the constructor is private.
-- Use explicit return type declarations and type hints for all method parameters: `function isAccessible(User $user, ?string $path = null): bool`
-- Use TitleCase for Enum keys: `FavoritePerson`, `BestLake`, `Monthly`.
-- Prefer PHPDoc blocks over inline comments. Only add inline comments for exceptionally complex logic.
-- Use array shape type definitions in PHPDoc blocks.
-
-=== deployments rules ===
-
-# Deployment
-
-- Laravel can be deployed using [Laravel Cloud](https://cloud.laravel.com/), which is the fastest way to deploy and scale production Laravel applications.
-- Activate the `deploying-to-cloud` skill whenever deploying to Laravel Cloud, configuring Cloud environments or resources, using the Cloud CLI, or troubleshooting Cloud deployments.
-
-=== laravel/core rules ===
-
-# Do Things the Laravel Way
-
-- Use `php artisan make:` commands to create new files (i.e. migrations, controllers, models, etc.). You can list available Artisan commands using `php artisan list` and check their parameters with `php artisan [command] --help`.
-- If you're creating a generic PHP class, use `php artisan make:class`.
-- Pass `--no-interaction` to all Artisan commands to ensure they work without user input. You should also pass the correct `--options` to ensure correct behavior.
-
-### Model Creation
-
-- When creating new models, create useful factories and seeders for them too. Ask the user if they need any other things, using `php artisan make:model --help` to check the available options.
-
-## APIs & Eloquent Resources
-
-- For APIs, default to using Eloquent API Resources and API versioning unless existing API routes do not, then you should follow existing application convention.
-
-## URL Generation
-
-- When generating links to other pages, prefer named routes and the `route()` function.
-
-## Testing
-
-- When creating models for tests, use the factories for the models. Check if the factory has custom states that can be used before manually setting up the model.
-- Faker: Use methods such as `$this->faker->word()` or `fake()->randomDigit()`. Follow existing conventions whether to use `$this->faker` or `fake()`.
-- When creating tests, make use of `php artisan make:test [options] {name}` to create a feature test, and pass `--unit` to create a unit test. Most tests should be feature tests.
-
-=== pint/core rules ===
-
-# Laravel Pint Code Formatter
-
-- If you have modified any PHP files, you must run `vendor/bin/pint --dirty --format agent` before finalizing changes to ensure your code matches the project's expected style.
-- Do not run `vendor/bin/pint --test --format agent`, simply run `vendor/bin/pint --format agent` to fix any formatting issues.
-
-=== pest/core rules ===
-
-# Pest
-
-- This project uses Pest. Create tests with `php artisan make:test --pest {name}`.
-- Do not include the test suite directory in `{name}`. Use `SomeFeatureTest`, not `Feature/SomeFeatureTest`.
-- Read the `testing-best-practices` skill for guidance on coverage, naming, structure, dependency isolation, and review.
-- Do not delete tests or test files without approval. They are part of the application.
-
-## Running Tests
-
-- Run the narrowest set of tests that covers the change. Pass a file path or `--filter=testName` to `php artisan test --compact`.
-- Rerun a test after each change to it.
-- Run `vendor/bin/pest` to call the test runner directly. It accepts the same file path and `--filter=testName` arguments.
-
-</laravel-boost-guidelines>
+- **Arsitektur Laravel 13:**
+    - Gunakan **Form Request** (`app/Http/Requests`) untuk validasi input dan upload file.
+    - Pisahkan logika bisnis kompleks (registrasi + kuota locking, approval + QR generation + mail dispatch, verifikasi scan) ke dalam **Action / Service classes** (`app/Actions` atau `app/Services`), jaga agar Controller tetap tipis.
+    - Buat dua class Mailable terpisah: `RegistrationApprovedMail` (dengan QR code) dan `RegistrationRejectedMail` (tanpa QR code).
+- **Keamanan File & Endpoint:**
+    - Simpan file `payment_proof` pada disk private (`storage/app/private/payment_proofs`) dengan nama file ter-hash, dan tampilkan kepada Admin melalui route controller terproteksi (`/admin/registrations/{registration}/proof`) agar tidak bisa diakses publik secara acak.
+    - Terapkan _rate limiting_ pada endpoint registrasi publik dan endpoint API pemindaian QR code.
+    - Jangan pernah mengekspos `id` internal database pada URL publik (`/e/{slug}`) maupun isi QR code.
+- **UI/UX Scanner:** Halaman `/scan/{token_hash}` wajib _mobile-first_, mendukung akses kamera belakang perangkat secara langsung, serta memberikan umpan balik visual yang kontras (Hijau / Kuning / Merah) dan notifikasi suara/getar agar cepat dibaca petugas di lapangan.
